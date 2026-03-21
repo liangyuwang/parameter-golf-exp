@@ -6,6 +6,51 @@ under a strict **≤ 16M parameter** budget.
 
 ---
 
+## Default Architecture Overview
+
+The baseline model in `train_gpt.py` is a GPT with the following structure:
+
+- **Embedding**: learned token embedding (`vocab_size=1024`), optionally tied
+  with the output head (`tie_embeddings=True` by default, saves ~0.5M params)
+- **Attention**: Grouped-Query Attention (GQA) with `num_kv_heads < num_heads`.
+  Q and K are RMSNorm'd, then RoPE is applied, then a per-head learned `q_gain`
+  scales Q before `F.scaled_dot_product_attention` with causal mask.
+- **MLP**: relu² activation — `relu(fc(x))² → proj(·)`. Two `CastedLinear` layers.
+- **Block residual**: learned `resid_mix` blends the current hidden state with
+  the original embedding (`x = mix[0]*x + mix[1]*x0`), then adds attention
+  (scaled by `attn_scale`) and MLP (scaled by `mlp_scale`).
+- **U-Net skip connections**: the first `num_layers // 2` blocks store
+  activations; the last `num_layers // 2` blocks add them back via learned
+  `skip_weights`.
+- **Output**: logit softcapping — `softcap * tanh(logits / softcap)`.
+- **Precision**: model body runs in **bf16**; `CastedLinear` stores weights
+  in **fp32** and casts to bf16 at forward time; control params (`attn_scale`,
+  `mlp_scale`, `resid_mix`, `q_gain`, `skip_weights`) stay in fp32.
+- **Compilation**: the model is compiled with `torch.compile`. Architectural
+  changes must be compatible with torch.compile (avoid unsupported ops or
+  excessive dynamic control flow).
+- **Distributed**: training uses `DistributedDataParallel` (DDP) across 8 GPUs
+  with `grad_accum_steps = 8 // world_size`.
+
+Default hyperparameters:
+
+| Field | Default |
+|---|---|
+| `num_layers` | `9` |
+| `model_dim` | `512` |
+| `num_heads` | `8` |
+| `num_kv_heads` | `4` |
+| `mlp_mult` | `2` |
+| `tie_embeddings` | `True` |
+| `rope_base` | `10000.0` |
+| `logit_softcap` | `30.0` |
+| `qk_gain_init` | `1.5` |
+
+This default config is ~17M params and exceeds the 16M budget. You must shrink
+the model before the first run.
+
+---
+
 ## Setup
 
 Work with the user to complete the following before starting experiments:
@@ -21,6 +66,9 @@ Work with the user to complete the following before starting experiments:
 3. **Read the in-scope files** for full context:
    - `train_gpt.py` — the only file you modify. Contains the GPT model,
      optimizer, and training loop.
+   - `records/` — past competitive submissions. Browse the READMEs for
+     architectural inspiration (note: many submissions also change the
+     optimizer or quantization, which is off-limits here).
 
 4. **Verify data exists**: Check that the following paths exist:
    - `./data/datasets/fineweb10B_sp1024/` — training and validation shards
@@ -32,6 +80,8 @@ Work with the user to complete the following before starting experiments:
    17M params and already exceeds the 16M budget. You must shrink the model
    before the first run. Use this quick estimate formula:
    ```
+   num_skip_weights = num_layers // 2
+
    total ≈ vocab_size × model_dim                              # embedding (shared if tied)
          + num_layers × (
              model_dim × model_dim                              # Q proj
@@ -40,9 +90,10 @@ Work with the user to complete the following before starting experiments:
            + model_dim × model_dim                              # attn out proj
            + model_dim × (mlp_mult × model_dim)                 # MLP fc
            + (mlp_mult × model_dim) × model_dim                 # MLP proj
-           + ~3 × model_dim                                     # control params
+           + ~3 × model_dim                                     # control params (attn_scale, mlp_scale, resid_mix)
+           + num_heads                                           # q_gain (per head)
          )
-         + num_skip_weights × model_dim                         # skip connections
+         + num_skip_weights × model_dim                         # U-Net skip connections
    ```
 
    Always verify the actual count from `grep "^model_params:" run.log`
@@ -81,34 +132,51 @@ Only modify the model architecture and model-shape hyperparameters inside
 
 In the `Hyperparameters` class — model shape fields only:
 ```python
-num_layers          # number of transformer blocks
-num_kv_heads        # GQA kv heads (must divide num_heads evenly)
-model_dim           # hidden dimension
-num_heads           # attention heads (must divide model_dim evenly)
-mlp_mult            # MLP hidden expansion factor
-tie_embeddings      # share embedding and lm_head weights (saves ~0.5M params)
-rope_base           # RoPE base frequency
-logit_softcap       # logit soft-capping value
-qk_gain_init        # initial QK gain value
+num_layers     = 9        # number of transformer blocks
+num_kv_heads   = 4        # GQA kv heads (must divide num_heads evenly)
+model_dim      = 512      # hidden dimension
+num_heads      = 8        # attention heads (must divide model_dim evenly)
+mlp_mult       = 2        # MLP hidden expansion factor
+tie_embeddings = True     # share embedding and lm_head weights (saves ~0.5M params)
+rope_base      = 10000.0  # RoPE base frequency
+logit_softcap  = 30.0     # logit soft-capping value
+qk_gain_init   = 1.5      # initial QK gain value
 ```
+
+`tied_embed_init_std` (default `0.005`) controls embedding initialization and
+is also considered a modifiable model parameter (not an optimizer parameter).
 
 Do NOT touch `vocab_size` — it must remain 1024 to match the fixed tokenizer.
 
 Model architecture classes — anything inside:
+- `GPT` — overall forward pass, U-Net skips, embedding, final norm, logits
 - `Block` — residual structure, normalization placement, skip weights
 - `CausalSelfAttention` — attention mechanism, QK norm, RoPE usage
-- `MLP` — activation function, gating, hidden size
-- `GPT` — overall forward pass, U-Net skips, embedding, final norm, logits
+- `MLP` — activation function (default: relu²), gating, hidden size
+- `CastedLinear` — linear layer with fp32 weight storage, bf16 compute
+- `RMSNorm` — RMS normalization
+- `Rotary` — RoPE cos/sin cache
+- `apply_rotary_emb` — RoPE application helper
 
-You may add new `nn.Module` subclasses or helper functions to support architectural changes.
+You may add new `nn.Module` subclasses or helper functions to support
+architectural changes. All changes must be compatible with `torch.compile`.
+
+Do NOT modify `train_gpt_mlx.py` — it is a separate MLX variant and is not
+part of this experiment.
 
 ## What You CANNOT Modify
 
 - **Optimizer code**: Do NOT change `Muon`, `zeropower_via_newtonschulz5`,
-  or any optimizer hyperparameters in `Hyperparameters`
-  (`embed_lr`, `matrix_lr`, `scalar_lr`, `muon_momentum`,
-  `beta1`, `beta2`, `adam_eps`, `warmdown_iters`, `warmup_steps`, etc.).
+  or any optimizer hyperparameters in `Hyperparameters`:
+  `embed_lr`, `head_lr`, `tied_embed_lr`, `matrix_lr`, `scalar_lr`,
+  `muon_momentum`, `muon_backend_steps`, `muon_momentum_warmup_start`,
+  `muon_momentum_warmup_steps`, `beta1`, `beta2`, `adam_eps`,
+  `grad_clip_norm`, `warmdown_iters`, `warmup_steps`.
   The optimizer is completely fixed.
+
+- **Training hyperparameters**: Do NOT change `train_batch_tokens`,
+  `train_seq_len`, `val_batch_size`, `val_loss_every`, `iterations`,
+  `train_log_every`, `max_wallclock_seconds`, or `seed`.
 
 - **Training loop**: Do NOT change gradient accumulation, LR schedule,
   warmup/warmdown logic, or wallclock stopping logic.
@@ -259,12 +327,25 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5`).
     - val_bpb improved (strictly lower) → keep the commit, advance branch
     - val_bpb same or worse → `git reset --hard HEAD~1`
 
+## Common Pitfalls
+
+- `num_heads` must evenly divide `model_dim` (otherwise attention reshape fails)
+- `num_kv_heads` must evenly divide `num_heads` (GQA repeat requirement)
+- U-Net skip connections assume `num_layers` is even (`num_layers // 2` skips
+  on each side). Odd layer counts still work but the middle layer has no skip.
+- `torch.compile` does not support all operations. If you add custom ops or
+  heavy dynamic control flow, training may fail to compile. Test early.
+- Changing `mlp_mult` or `model_dim` has a large impact on param count —
+  always re-estimate before running.
+- OOM: increasing `model_dim` or adding parameters increases memory. Check
+  `peak memory` in the log if runs crash silently.
+
 ## Simplicity Criterion
 
 All else being equal, simpler is better.
 
 - A small val_bpb improvement that adds significant complexity: probably not worth keeping.
-- Removing a component and getting equal or better val_bpb: always keep —- that is a simplification win.
+- Removing a component and getting equal or better val_bpb: always keep — that is a simplification win.
 - A near-zero improvement from a clean, well-motivated change: keep it.
 - A near-zero improvement from a hacky workaround: discard it.
 
@@ -275,7 +356,7 @@ Your only lever is the model structure and its hyperparameters.
 
 Recommended exploration order (roughly easy to ambitious):
 
-**Phase 1 —- Establish a valid baseline**
+**Phase 1 — Establish a valid baseline**
 
 Find a config with ≤ 16M params that trains stably. The default config is ~17M,
 so shrink it. Suggested starting point:
@@ -309,7 +390,9 @@ equal total param count:
 
 **Phase 4 — MLP variants**
 
-- Activation: try SwiGLU-style gating
+The default MLP uses **relu²** (relu squared): `relu(fc(x))² → proj(·)`.
+
+- Activation: replace relu² with SwiGLU-style gating
   (note: gated MLP uses ~1.5× params of standard MLP for same hidden size,
   shrink `model_dim` accordingly to stay under 16M)
 - `mlp_mult`: try 1, 3, 4
@@ -327,7 +410,8 @@ equal total param count:
 
 - `logit_softcap`: try 10, 20, 50
 - Embedding scaling: multiply embedding output by a learned scalar
-- Different `tied_embed_init_std` values
+- `tied_embed_init_std` (default `0.005`): try different values — this is
+  a model initialization parameter and is allowed to change
 
 **Phase 7 — Novel combinations**
 
